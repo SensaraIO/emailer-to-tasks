@@ -2,7 +2,7 @@
 
 This project converts Gmail emails into actionable tasks using AI, organizing them by project and thread.
 
-## Features
+## Feature
 
 - **Gmail Integration**: OAuth-based Gmail connection with push notifications
 - **Smart Subject Parsing**: Recognizes Basecamp-style subjects like `($coding- App (Client)) Thread`
