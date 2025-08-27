@@ -1,7 +1,8 @@
 fastapi
 uvicorn
 pydantic
-psycopg[binary]
+motor
+pymongo
 python-dotenv
 httpx
 google-auth

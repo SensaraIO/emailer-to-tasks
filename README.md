@@ -20,17 +20,14 @@ This project converts Gmail emails into actionable tasks using AI, organizing th
    - Pub/Sub API enabled
    - OAuth 2.0 credentials (Web application type)
 
-2. PostgreSQL database (Neon, Supabase, or any PostgreSQL instance)
+2. MongoDB database (MongoDB Atlas, local instance, or any MongoDB deployment)
 
 3. OpenAI API key
 
 ### 1. Database Setup
 
-Run the SQL migrations:
-
-```bash
-psql $DATABASE_URL < migrations.sql
-```
+MongoDB collections and indexes will be automatically created on first run. 
+No manual migration needed - the app creates indexes on startup.
 
 ### 2. Environment Configuration
 
@@ -41,7 +38,7 @@ cp .env.example .env
 ```
 
 Required variables:
-- `DATABASE_URL`: PostgreSQL connection string
+- `MONGODB_URI`: MongoDB connection string (e.g., `mongodb+srv://...`)
 - `OPENAI_API_KEY`: Your OpenAI API key
 - `GOOGLE_CLIENT_ID`: OAuth client ID from Google Cloud Console
 - `GOOGLE_CLIENT_SECRET`: OAuth client secret

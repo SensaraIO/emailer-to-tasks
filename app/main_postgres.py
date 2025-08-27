@@ -4,10 +4,8 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import DuplicateKeyError
+import psycopg
 import httpx
-from bson import ObjectId
 
 # Google
 from google.oauth2.credentials import Credentials
@@ -16,7 +14,7 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-MONGODB_URI = os.getenv("MONGODB_URI", os.getenv("DATABASE_URL"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -29,31 +27,9 @@ PUBSUB_VERIFICATION_TOKEN = os.getenv("PUBSUB_VERIFICATION_TOKEN", "")
 
 app = FastAPI(title="Gmail → AI → TaskBoard")
 
-# -------------------- MongoDB Setup --------------------
-client = AsyncIOMotorClient(MONGODB_URI)
-db = client.emailer_tasks
-
-# Collections
-projects_col = db.projects
-threads_col = db.threads
-emails_col = db.emails
-tasks_col = db.tasks
-google_oauth_col = db.google_oauth
-gmail_state_col = db.gmail_state
-
-# Create indexes on startup
-@app.on_event("startup")
-async def create_indexes():
-    # Unique indexes
-    await projects_col.create_index("normalized_key", unique=True)
-    await threads_col.create_index([("project_id", 1), ("subject", 1)], unique=True)
-    await google_oauth_col.create_index("email", unique=True)
-    await gmail_state_col.create_index("email", unique=True)
-    
-    # Regular indexes for queries
-    await emails_col.create_index("thread_id")
-    await tasks_col.create_index("thread_id")
-    await emails_col.create_index("gmail_message_id")
+# -------------------- DB helpers --------------------
+def db():
+    return psycopg.connect(DATABASE_URL, autocommit=True)
 
 def slugify(s: str) -> str:
     import re
@@ -144,37 +120,37 @@ async def ai_extract_tasks(subject: str, body_text: str) -> AIExtractResponse:
 # -------------------- OAuth & Gmail client --------------------
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.modify"]
 
-async def save_tokens(email:str, creds:Credentials):
-    token_data = {
-        "email": email,
-        "access_token": creds.token,
-        "refresh_token": creds.refresh_token or "",
-        "token_expiry": creds.expiry,
-        "scope": " ".join(creds.scopes or []),
-        "updated_at": dt.datetime.utcnow()
-    }
-    await google_oauth_col.update_one(
-        {"email": email},
-        {"$set": token_data},
-        upsert=True
-    )
+def save_tokens(email:str, creds:Credentials):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            insert into google_oauth (email, access_token, refresh_token, token_expiry, scope)
+            values (%s,%s,%s,%s,%s)
+            on conflict (email) do update set
+              access_token=excluded.access_token,
+              refresh_token=excluded.refresh_token,
+              token_expiry=excluded.token_expiry,
+              scope=excluded.scope,
+              updated_at=now()
+        """, (email, creds.token, creds.refresh_token or "", creds.expiry, " ".join(creds.scopes or [])))
 
-async def load_tokens(email:str) -> Optional[Credentials]:
-    doc = await google_oauth_col.find_one({"email": email})
-    if not doc:
-        return None
-    
-    creds = Credentials(
-        token=doc["access_token"],
-        refresh_token=doc.get("refresh_token", ""),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=(doc.get("scope", "") or "").split()
-    )
-    if doc.get("token_expiry"):
-        creds.expiry = doc["token_expiry"]
-    return creds
+def load_tokens(email:str) -> Optional[Credentials]:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("select access_token, refresh_token, token_expiry, scope from google_oauth where email=%s", (email,))
+        row = cur.fetchone()
+        if not row: return None
+        access, refresh, expiry, scope = row
+        creds = Credentials(
+            token=access,
+            refresh_token=refresh,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=(scope or "").split()
+        )
+        # set expiry
+        if isinstance(expiry, dt.datetime):
+            creds.expiry = expiry
+        return creds
 
 def gmail_service(creds: Credentials):
     if not creds.valid and creds.refresh_token:
@@ -203,10 +179,11 @@ def oauth_start():
         include_granted_scopes="true",
         prompt="consent"
     )
+    # store state in a short-lived cookie if you like; for simplicity return it
     return JSONResponse({"auth_url": auth_url, "state": state})
 
 @app.get("/oauth/google/callback")
-async def oauth_callback(code: str, state: Optional[str] = None):
+def oauth_callback(code: str, state: Optional[str] = None):
     flow = Flow.from_client_config(
         {
           "web": {
@@ -222,20 +199,18 @@ async def oauth_callback(code: str, state: Optional[str] = None):
     flow.redirect_uri = OAUTH_REDIRECT_URI
     flow.fetch_token(code=code)
     creds = flow.credentials
-    
     # determine the account's email
     svc = gmail_service(creds)
     profile = svc.users().getProfile(userId="me").execute()
     email_addr = profile["emailAddress"]
-    await save_tokens(email_addr, creds)
+    save_tokens(email_addr, creds)
     return RedirectResponse(url=f"/gmail/watch?email={email_addr}")
 
 # -------------------- Start/stop Gmail watch --------------------
 @app.get("/gmail/watch")
-async def gmail_watch(email: str):
-    creds = await load_tokens(email)
-    if not creds: 
-        raise HTTPException(400, "Connect Gmail first.")
+def gmail_watch(email: str):
+    creds = load_tokens(email)
+    if not creds: raise HTTPException(400, "Connect Gmail first.")
     svc = gmail_service(creds)
 
     body = {"topicName": GMAIL_TOPIC}
@@ -244,29 +219,22 @@ async def gmail_watch(email: str):
     resp = svc.users().watch(userId="me", body=body).execute()
 
     history_id = resp.get("historyId")
-    await gmail_state_col.update_one(
-        {"email": email},
-        {"$set": {
-            "history_id": int(history_id) if history_id else None,
-            "watch_active": True,
-            "updated_at": dt.datetime.utcnow()
-        }},
-        upsert=True
-    )
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+          insert into gmail_state (email, history_id, watch_active, updated_at)
+          values (%s,%s,true,now())
+          on conflict (email) do update set history_id=excluded.history_id, watch_active=true, updated_at=now()
+        """, (email, history_id))
     return {"ok": True, "email": email, "history_id": history_id}
 
 @app.get("/gmail/stop")
-async def gmail_stop(email: str):
-    creds = await load_tokens(email)
-    if not creds: 
-        raise HTTPException(400, "Connect Gmail first.")
+def gmail_stop(email: str):
+    creds = load_tokens(email)
+    if not creds: raise HTTPException(400, "Connect Gmail first.")
     svc = gmail_service(creds)
     svc.users().stop(userId="me").execute()
-    
-    await gmail_state_col.update_one(
-        {"email": email},
-        {"$set": {"watch_active": False, "updated_at": dt.datetime.utcnow()}}
-    )
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("update gmail_state set watch_active=false, updated_at=now() where email=%s", (email,))
     return {"ok": True}
 
 # -------------------- Pub/Sub push endpoint --------------------
@@ -274,8 +242,15 @@ class PubSubPush(BaseModel):
     message: Dict
     subscription: Optional[str] = None
 
+def verify_pubsub(request: Request):
+    if PUBSUB_VERIFICATION_TOKEN:
+        token = request.headers.get("X-Goog-Resource-State", "")  # not actually a token; alt custom scheme:
+        # Simpler: use a querystring ?token=..., or header "X-PubSub-Token"
+    return True
+
 @app.post("/gmail/push")
 async def gmail_push(request: Request):
+    # (Optional) add a token check in query/header if you like.
     body = await request.json()
     msg = body.get("message", {})
     data_b64 = msg.get("data", "")
@@ -283,32 +258,32 @@ async def gmail_push(request: Request):
         return {"ok": True}
 
     data = json.loads(base64.b64decode(data_b64))
+    # data has {emailAddress, historyId}
     email = data.get("emailAddress")
     history_id = int(data.get("historyId", 0))
     if not email or not history_id:
         return {"ok": True}
 
+    # Continue processing in-line (simple); or enqueue to a worker.
     await process_history(email, history_id)
     return {"ok": True}
 
 # -------------------- Process Gmail history & create tasks --------------------
 async def process_history(email: str, new_history_id: int):
-    creds = await load_tokens(email)
-    if not creds: 
-        return
+    creds = load_tokens(email)
+    if not creds: return
     svc = gmail_service(creds)
 
     # find last history id
-    state_doc = await gmail_state_col.find_one({"email": email})
-    last_history = state_doc.get("history_id") if state_doc else None
+    with db() as conn, conn.cursor() as cur:
+      cur.execute("select history_id from gmail_state where email=%s", (email,))
+      row = cur.fetchone()
+      last_history = int(row[0]) if row and row[0] else None
 
     # If we have no cursor, just set it; avoid backfilling everything.
     if not last_history:
-        await gmail_state_col.update_one(
-            {"email": email},
-            {"$set": {"history_id": new_history_id, "updated_at": dt.datetime.utcnow()}},
-            upsert=True
-        )
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("update gmail_state set history_id=%s, updated_at=now() where email=%s", (new_history_id, email))
         return
 
     page_token = None
@@ -324,14 +299,12 @@ async def process_history(email: str, new_history_id: int):
                 msg_id = added["message"]["id"]
                 await handle_message(svc, msg_id)
         page_token = hist.get("nextPageToken")
-        if not page_token: 
-            break
+        if not page_token: break
 
     # advance cursor
-    await gmail_state_col.update_one(
-        {"email": email},
-        {"$set": {"history_id": new_history_id, "updated_at": dt.datetime.utcnow()}}
-    )
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("update gmail_state set history_id=%s, updated_at=now() where email=%s",
+                    (new_history_id, email))
 
 def decode_mime_b64(s: str) -> str:
     try:
@@ -355,91 +328,46 @@ async def handle_message(svc, msg_id: str):
     # Parse subject → project/thread
     pieces = parse_subject(subject)
 
-    # Upsert project
-    project_id = await upsert_project(
-        pieces["project_name"], 
-        pieces["app"], 
-        pieces["client"], 
-        pieces["kind"]
-    )
-    
-    # Upsert thread
-    thread_id = await upsert_thread(project_id, pieces["thread"])
-    
-    # Insert email
-    email_doc = {
-        "thread_id": thread_id,
-        "gmail_message_id": msg_id,
-        "from_name": from_name,
-        "from_email": from_email,
-        "subject": subject,
-        "body_html": body_html,
-        "body_text": body_text,
-        "received_at": received_at,
-        "created_at": dt.datetime.utcnow()
-    }
-    email_result = await emails_col.insert_one(email_doc)
-    email_id = email_result.inserted_id
+    # Write to DB + AI extract
+    with db() as conn, conn.cursor() as cur:
+        project_id = upsert_project(cur, pieces["project_name"], pieces["app"], pieces["client"], pieces["kind"])
+        thread_id  = upsert_thread(cur, project_id, pieces["thread"])
+        cur.execute("""insert into emails (thread_id, gmail_message_id, from_name, from_email, subject, body_html, body_text, received_at)
+                       values (%s,%s,%s,%s,%s,%s,%s,%s) returning id""",
+                    (thread_id, msg_id, from_name, from_email, subject, body_html, body_text, received_at))
+        email_row_id = cur.fetchone()[0]
 
     # AI extract → tasks
     extraction = await ai_extract_tasks(subject, body_text or "")
-    for t in extraction.tasks:
-        due = None
-        if t.due_on:
-            try: 
-                due = dt.datetime.fromisoformat(t.due_on)
-            except: 
-                pass
-        
-        task_doc = {
-            "thread_id": thread_id,
-            "title": t.title,
-            "description": t.description,
-            "priority": t.priority or "normal",
-            "due_on": due,
-            "assignee_hint": t.assignee_hint,
-            "status": "open",
-            "source_email_id": email_id,
-            "created_at": dt.datetime.utcnow()
-        }
-        await tasks_col.insert_one(task_doc)
+    with db() as conn, conn.cursor() as cur:
+        for t in extraction.tasks:
+            due = None
+            if t.due_on:
+                try: due = dt.date.fromisoformat(t.due_on)
+                except: pass
+            cur.execute("""insert into tasks (thread_id, title, description, priority, due_on, assignee_hint, source_email_id)
+                           values (%s,%s,%s,%s,%s,%s,%s)""",
+                        (thread_id, t.title, t.description, (t.priority or "normal"), due, t.assignee_hint, email_row_id))
 
-async def upsert_project(name: str, app: Optional[str], client: Optional[str], kind: str):
+def upsert_project(cur, name: str, app: Optional[str], client: Optional[str], kind: str):
     nk = slugify(name)
-    project_doc = {
-        "name": name,
-        "normalized_key": nk,
-        "app_name": app,
-        "client_name": client,
-        "kind": kind,
-        "created_at": dt.datetime.utcnow()
-    }
-    
-    result = await projects_col.update_one(
-        {"normalized_key": nk},
-        {"$set": project_doc},
-        upsert=True
-    )
-    
-    if result.upserted_id:
-        return result.upserted_id
-    else:
-        doc = await projects_col.find_one({"normalized_key": nk})
-        return doc["_id"]
+    cur.execute("""insert into projects (name, normalized_key, app_name, client_name, kind)
+                   values (%s,%s,%s,%s,%s)
+                   on conflict (normalized_key) do update set name=excluded.name
+                   returning id""",
+                (name, nk, app, client, kind))
+    return cur.fetchone()[0]
 
-async def upsert_thread(project_id, subject: str):
-    thread_doc = {
-        "project_id": project_id,
-        "subject": subject,
-        "created_at": dt.datetime.utcnow()
-    }
-    
-    try:
-        result = await threads_col.insert_one(thread_doc)
-        return result.inserted_id
-    except DuplicateKeyError:
-        doc = await threads_col.find_one({"project_id": project_id, "subject": subject})
-        return doc["_id"]
+def upsert_thread(cur, project_id, subject: str):
+    cur.execute("""insert into threads (project_id, subject)
+                   values (%s,%s)
+                   on conflict (project_id, subject) do nothing
+                   returning id""",
+                (project_id, subject))
+    row = cur.fetchone()
+    if row: return row[0]
+    cur.execute("select id from threads where project_id=%s and subject=%s", (project_id, subject))
+    return cur.fetchone()[0]
 
 def parse_from(from_header: str):
     import email.utils as eu
@@ -463,67 +391,3 @@ def extract_bodies(payload) -> (str, str):
             html = html or h
         return text, html
     return None, None
-
-# -------------------- API endpoints for tasks --------------------
-@app.get("/api/tasks")
-async def get_tasks():
-    pipeline = [
-        {
-            "$lookup": {
-                "from": "threads",
-                "localField": "thread_id",
-                "foreignField": "_id",
-                "as": "thread"
-            }
-        },
-        {"$unwind": "$thread"},
-        {
-            "$lookup": {
-                "from": "projects",
-                "localField": "thread.project_id",
-                "foreignField": "_id",
-                "as": "project"
-            }
-        },
-        {"$unwind": "$project"},
-        {
-            "$project": {
-                "task_id": "$_id",
-                "title": 1,
-                "description": 1,
-                "priority": 1,
-                "due_on": 1,
-                "status": 1,
-                "assignee_hint": 1,
-                "created_at": 1,
-                "thread_id": "$thread._id",
-                "thread_subject": "$thread.subject",
-                "project_id": "$project._id",
-                "project_name": "$project.name",
-                "kind": "$project.kind",
-                "client_name": "$project.client_name",
-                "app_name": "$project.app_name"
-            }
-        },
-        {
-            "$sort": {
-                "project_name": 1,
-                "thread_subject": 1,
-                "created_at": -1
-            }
-        }
-    ]
-    
-    tasks = []
-    async for doc in tasks_col.aggregate(pipeline):
-        # Convert ObjectId to string for JSON serialization
-        doc["task_id"] = str(doc["task_id"])
-        doc["thread_id"] = str(doc["thread_id"])
-        doc["project_id"] = str(doc["project_id"])
-        if doc.get("due_on"):
-            doc["due_on"] = doc["due_on"].isoformat()
-        if doc.get("created_at"):
-            doc["created_at"] = doc["created_at"].isoformat()
-        tasks.append(doc)
-    
-    return tasks
