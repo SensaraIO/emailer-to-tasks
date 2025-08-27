@@ -69,8 +69,9 @@ Backend (Python):
 pip install -r requirements.txt
 ```
 
-Frontend (Next.js):
+Frontend (Next.js) - Optional local development:
 ```bash
+cd frontend
 npm install
 ```
 
@@ -81,8 +82,9 @@ Start the FastAPI backend:
 uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
 
-Start the Next.js frontend (in another terminal):
+Start the Next.js frontend (optional, for local development):
 ```bash
+cd frontend
 npm run dev
 ```
 

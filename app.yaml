@@ -1,0 +1,10 @@
+name: emailer-to-tasks
+services:
+- environment_slug: python
+  github:
+    branch: main
+    deploy_on_push: true
+    repo: SensaraIO/emailer-to-tasks
+  name: api
+  run_command: uvicorn app.main:app --host 0.0.0.0 --port 8080
+  source_dir: /
