@@ -8,6 +8,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
 import httpx
 from bson import ObjectId
+import re
 
 # Google
 from google.oauth2.credentials import Credentials
@@ -293,6 +294,33 @@ def gmail_service(creds: Credentials):
         pass
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
+# Wrapper: build a Gmail service for a stored OAuth email
+# Selects the most-recent OAuth doc if no email is provided
+from google.auth.transport.requests import Request as _GReq
+
+async def gmail_service_for_email(user_email: str | None = None):
+    """Return a Gmail API service bound to the OAuth credentials for the given email.
+    If no email is provided, the most recently updated stored OAuth doc is used.
+    """
+    # Pick the target OAuth record
+    query = {"email": user_email} if user_email else {}
+    doc = await google_oauth_col.find_one(query, sort=[("updated_at", -1)])
+    if not doc:
+        raise RuntimeError("No Google OAuth credentials found. Please connect Gmail.")
+    email = doc["email"]
+
+    # Load creds using existing helper
+    creds = await load_tokens(email)
+    if not creds:
+        raise RuntimeError(f"No credentials for {email}")
+
+    # Refresh if needed and persist
+    if not creds.valid and creds.refresh_token:
+        creds.refresh(_GReq())
+        await save_tokens(email, creds)
+
+    return gmail_service(creds)
+
 # -------------------- OAuth routes --------------------
 @app.get("/oauth/google/start")
 def oauth_start():
@@ -450,6 +478,39 @@ def decode_mime_b64(s: str) -> str:
     except Exception:
         return ""
 
+def extract_basecamp_link(body_text: Optional[str], body_html: Optional[str]) -> Optional[str]:
+    """Extract a direct Basecamp thread URL from email content, if present.
+    Prefers a link following cues like 'respond in Basecamp' and falls back to the first
+    messages/todos link under 3.basecamp.com.
+    """
+    text = (body_text or "")
+    html = (body_html or "")
+
+    # Helper to find the first matching URL from a position
+    def find_match(s: str, start: int = 0) -> Optional[str]:
+        m = re.search(r"https?://3\.basecamp\.com/\d+/buckets/\d+/(?:messages|todos)[^\s<>\"]+", s[start:], re.I)
+        if m:
+            return m.group(0)
+        return None
+
+    # Look for cues in plain text and pick the next Basecamp URL after the cue
+    for cue in ["respond in basecamp", "reply to this email", "open in basecamp", "reply to", "respond in", "open in"]:
+        idx = text.lower().find(cue)
+        if idx != -1:
+            u = find_match(text, idx)
+            if u:
+                return u
+
+    # Try HTML anchors containing Open/Reply labels
+    m = re.search(r"href=\"(https?://3\.basecamp\.com/[^\"]+)\"[^>]*>(?:[^<]*Basecamp|Open in Basecamp|Reply)", html, re.I)
+    if m:
+        url = m.group(1)
+        if re.search(r"/buckets/\d+/(?:messages|todos)/", url):
+            return url
+
+    # Fallback: first messages/todos link anywhere in text
+    return find_match(text) or None
+
 async def handle_message(svc, msg_id: str):
     msg = svc.users().messages().get(userId="me", id=msg_id, format="full").execute()
 
@@ -457,6 +518,8 @@ async def handle_message(svc, msg_id: str):
     subject = headers.get("subject", "")
     from_raw = headers.get("from", "")
     from_name, from_email = parse_from(from_raw)
+    reply_to_raw = headers.get("reply-to", "")
+    reply_to_name, reply_to_email = parse_from(reply_to_raw)
     received_ts = int(msg.get("internalDate", "0"))/1000.0
     received_at = dt.datetime.utcfromtimestamp(received_ts)
 
@@ -466,15 +529,17 @@ async def handle_message(svc, msg_id: str):
     # Clean noisy prefixes for better downstream parsing
     subject_clean = clean_subject(subject)
 
+    # Body (plain/text preferred; else html)
+    body_text, body_html = extract_bodies(msg.get("payload", {}))
+    body_text = body_text or ""
+    body_html = body_html or ""
+
     # AI classification to unify projects by CLIENT and side (client/dev)
     classification = await ai_classify_email(subject_clean, body_text or body_html or "", headers)
 
     # If it's clearly not a real project email, skip processing entirely
     if not classification.is_project_email:
         return
-
-    # Body (plain/text preferred; else html)
-    body_text, body_html = extract_bodies(msg.get("payload", {}))
 
     # Parse subject (regex fallback) and merge with AI classification
     pieces = parse_subject(subject_clean)
@@ -523,6 +588,13 @@ async def handle_message(svc, msg_id: str):
 
     # AI extract → tasks
     extraction = await ai_extract_tasks(subject, body_text or "")
+    # Prefer Reply-To as the assigner if it exists or the From address looks robotic
+    import re as _re
+    robot_like = bool(_re.search(r"(no-?reply|notification|notifications|donotreply|do-not-reply)", (from_email or ""), _re.I))
+    use_reply_to = bool(reply_to_email) and (robot_like or (from_email or "").lower() != reply_to_email.lower())
+    assigned_by_name = (reply_to_name or from_name) if use_reply_to else (from_name or reply_to_name)
+    assigned_by_email = (reply_to_email or from_email) if use_reply_to else (from_email or reply_to_email)
+    source_thread_url = extract_basecamp_link(body_text, body_html)
     for t in extraction.tasks:
         due = None
         if t.due_on:
@@ -540,12 +612,15 @@ async def handle_message(svc, msg_id: str):
             "assignee_hint": t.assignee_hint,
             "status": "open",
             "source_email_id": email_id,
+            "source_thread_url": source_thread_url,
             "created_at": dt.datetime.utcnow()
         }
         task_doc.update({
             "side": side,  # client or dev
             "client_name": client_name,
             "addressed_to_me": email_doc.get("addressed_to_me", False),
+            "assigned_by_name": assigned_by_name,
+            "assigned_by_email": assigned_by_email,
         })
         await tasks_col.insert_one(task_doc)
 
@@ -650,6 +725,9 @@ async def get_tasks():
                 "app_name": "$project.app_name",
                 "side": 1,
                 "addressed_to_me": 1,
+                "assigned_by_name": 1,
+                "assigned_by_email": 1,
+                "source_thread_url": 1,
             }
         },
         {
