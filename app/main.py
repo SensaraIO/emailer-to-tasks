@@ -54,6 +54,8 @@ async def create_indexes():
     await emails_col.create_index("thread_id")
     await tasks_col.create_index("thread_id")
     await emails_col.create_index("gmail_message_id")
+    await tasks_col.create_index([("client_name", 1), ("side", 1), ("status", 1), ("created_at", -1)])
+    await emails_col.create_index([("client_name", 1), ("side", 1), ("received_at", -1)])
 
 def slugify(s: str) -> str:
     import re
@@ -63,7 +65,7 @@ def slugify(s: str) -> str:
 BC_SUBJECT_RE = re.compile(
     r"""
     (?:^|\s)\(
-    \s*\$coding-\s*
+    \s*\$\s*coding\s*[-–—]?\s*
     (?P<app>.+?)\s*
     \(
       (?P<client>.+?)
@@ -74,7 +76,7 @@ BC_SUBJECT_RE = re.compile(
 )
 
 CLIENT_ONLY_RE = re.compile(
-    r"""^\(\s*(?P<client>[^)]+)\s*\)\s*(?P<thread>.+?)\s*$""",
+    r"""^(?:re:|fwd?:)?\s*\(\s*(?P<client>[^)]+)\s*\)\s*(?P<thread>.+?)\s*$""",
     re.IGNORECASE | re.VERBOSE
 )
 
@@ -94,6 +96,45 @@ def parse_subject(subject: str):
         return {"kind":"client", "project_name": client, "app": None, "client": client, "thread": thread}
     return {"kind":"client", "project_name": subject or "General", "app": None, "client": None, "thread": "General"}
 
+ 
+# -------------------- Subject hygiene & heuristics --------------------
+NON_PROJECT_SUBJECT_PATTERNS = [
+    r"delivery status notification",
+    r"mail delivery (?:subsystem|failed)",
+    r"out of office",
+    r"auto(?:matic)? reply",
+    r"added you to a project in basecamp",
+    r"invitation",
+    r"newsletter",
+]
+
+def looks_like_non_project(subject: str) -> bool:
+    s = (subject or "").lower()
+    return any(re.search(p, s) for p in NON_PROJECT_SUBJECT_PATTERNS)
+
+PREFIX_RE = re.compile(r"^(re:|fwd?:)\s*", re.IGNORECASE)
+
+def clean_subject(s: str) -> str:
+    s = (s or "").strip()
+    # strip repeated RE:/FWD:
+    while True:
+        m = PREFIX_RE.match(s)
+        if not m:
+            break
+        s = s[m.end():].strip()
+    return s
+
+CLIENT_NAME_NORMALIZER = re.compile(r"\s+\(|\)\s*$")
+
+def normalize_client_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    n = name.strip()
+    # collapse multiple spaces and strip stray parentheses
+    n = re.sub(r"\s+", " ", n)
+    n = CLIENT_NAME_NORMALIZER.sub("", n)
+    return n
+
 # -------------------- AI extraction --------------------
 class ExtractedTask(BaseModel):
     title: str
@@ -104,6 +145,76 @@ class ExtractedTask(BaseModel):
 
 class AIExtractResponse(BaseModel):
     tasks: List[ExtractedTask] = []
+
+# -------------------- AI classification model --------------------
+class EmailClassification(BaseModel):
+    is_project_email: bool = True
+    client_name: Optional[str] = None
+    side: Optional[str] = Field(default=None, pattern=r"^(client|dev)$")
+    thread: Optional[str] = None
+    addressed_to_zac: bool = False
+    coding_app_name: Optional[str] = None
+
+CLASSIFY_SYSTEM_PROMPT = (
+    "You are an expert at reading Basecamp email notifications and normal emails "
+    "and classifying them for a task system. "
+    "Infer the canonical CLIENT name (e.g., 'John James'). "
+    "If the subject contains a pattern like '($Coding- Project Name (Client)) ...', set side='dev' and coding_app_name='Project Name'. "
+    "If the subject contains '(Client) ...' without '$Coding-', set side='client'. "
+    "Extract a short thread title (like 'Designs', 'Internal Review'). "
+    "Set addressed_to_zac=true if the To/CC list includes any variant of Zachary/Zac Cheshire. "
+    "Set is_project_email=false for bounces, OOO, newsletters, or Basecamp meta emails like 'added you to a project'. "
+    "Return only the JSON for EmailClassification."
+)
+
+def build_classify_prompt(subject: str, body: str, headers: Dict[str, str]) -> str:
+    to = headers.get("to", "")
+    cc = headers.get("cc", "")
+    frm = headers.get("from", "")
+    return (
+        f"Subject: {subject}\n\n"
+        f"From: {frm}\nTo: {to}\nCC: {cc}\n\n"
+        f"Body (first 2k):\n{(body or '')[:2000]}\n\n"
+        "Return strictly this JSON schema (fields may be null):\n" + EmailClassification.schema_json(indent=2)
+    )
+
+async def ai_classify_email(subject: str, body_text: str, headers: Dict[str, str]) -> EmailClassification:
+    # quick local guardrails first
+    if looks_like_non_project(subject):
+        return EmailClassification(is_project_email=False)
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers_http = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {
+        "model": "gpt-4o-mini",
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
+            {"role": "user", "content": build_classify_prompt(subject, body_text or "", headers)},
+        ],
+        "temperature": 0.0,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            r = await client.post(url, headers=headers_http, json=payload)
+            r.raise_for_status()
+            data = r.json()
+        parsed = json.loads(data["choices"][0]["message"]["content"]) or {}
+        return EmailClassification(**parsed)
+    except Exception:
+        # Fallback: attempt regex-based classification
+        s = clean_subject(subject)
+        m = BC_SUBJECT_RE.search(s)
+        if m:
+            client_name = normalize_client_name(m.group("client").strip())
+            thread = m.group("thread").strip()
+            return EmailClassification(is_project_email=True, client_name=client_name, side="dev", thread=thread, coding_app_name=m.group("app").strip())
+        m2 = CLIENT_ONLY_RE.search(s)
+        if m2:
+            client_name = normalize_client_name(m2.group("client").strip())
+            thread = m2.group("thread").strip()
+            return EmailClassification(is_project_email=True, client_name=client_name, side="client", thread=thread)
+        return EmailClassification(is_project_email=False)
 
 SYSTEM_PROMPT = """You are a task extraction engine.
 Extract zero or more actionable tasks from an email. 
@@ -349,23 +460,45 @@ async def handle_message(svc, msg_id: str):
     received_ts = int(msg.get("internalDate", "0"))/1000.0
     received_at = dt.datetime.utcfromtimestamp(received_ts)
 
+    to_raw = headers.get("to", "")
+    cc_raw = headers.get("cc", "")
+
+    # Clean noisy prefixes for better downstream parsing
+    subject_clean = clean_subject(subject)
+
+    # AI classification to unify projects by CLIENT and side (client/dev)
+    classification = await ai_classify_email(subject_clean, body_text or body_html or "", headers)
+
+    # If it's clearly not a real project email, skip processing entirely
+    if not classification.is_project_email:
+        return
+
     # Body (plain/text preferred; else html)
     body_text, body_html = extract_bodies(msg.get("payload", {}))
 
-    # Parse subject → project/thread
-    pieces = parse_subject(subject)
+    # Parse subject (regex fallback) and merge with AI classification
+    pieces = parse_subject(subject_clean)
 
-    # Upsert project
+    client_name = normalize_client_name(classification.client_name or pieces.get("client"))
+    side = classification.side or ("dev" if pieces.get("kind") == "coding" else "client")
+    thread_title = (classification.thread or pieces.get("thread") or subject_clean).strip()
+    coding_app = classification.coding_app_name or pieces.get("app")
+
+    if not client_name:
+        # If we still can't determine a client, do not create a project/thread
+        return
+
+    # Upsert a single unified project per client (name = client display name)
     project_id = await upsert_project(
-        pieces["project_name"], 
-        pieces["app"], 
-        pieces["client"], 
-        pieces["kind"]
+        name=client_name,
+        app=coding_app,
+        client=client_name,
+        kind="unified",
     )
-    
-    # Upsert thread
-    thread_id = await upsert_thread(project_id, pieces["thread"])
-    
+
+    # Upsert thread under that unified project
+    thread_id = await upsert_thread(project_id, thread_title)
+
     # Insert email
     email_doc = {
         "thread_id": thread_id,
@@ -378,6 +511,13 @@ async def handle_message(svc, msg_id: str):
         "received_at": received_at,
         "created_at": dt.datetime.utcnow()
     }
+    email_doc.update({
+        "to": to_raw,
+        "cc": cc_raw,
+        "client_name": client_name,
+        "side": side,
+        "addressed_to_me": bool(re.search(r"\b(zac(hary)?\s+cheshire)\b", f"{to_raw} {cc_raw}", re.IGNORECASE)),
+    })
     email_result = await emails_col.insert_one(email_doc)
     email_id = email_result.inserted_id
 
@@ -402,6 +542,11 @@ async def handle_message(svc, msg_id: str):
             "source_email_id": email_id,
             "created_at": dt.datetime.utcnow()
         }
+        task_doc.update({
+            "side": side,  # client or dev
+            "client_name": client_name,
+            "addressed_to_me": email_doc.get("addressed_to_me", False),
+        })
         await tasks_col.insert_one(task_doc)
 
 async def upsert_project(name: str, app: Optional[str], client: Optional[str], kind: str):
@@ -501,8 +646,10 @@ async def get_tasks():
                 "project_id": "$project._id",
                 "project_name": "$project.name",
                 "kind": "$project.kind",
-                "client_name": "$project.client_name",
-                "app_name": "$project.app_name"
+                "client_name": 1,
+                "app_name": "$project.app_name",
+                "side": 1,
+                "addressed_to_me": 1,
             }
         },
         {
